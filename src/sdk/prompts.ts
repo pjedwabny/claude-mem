@@ -1,5 +1,7 @@
 
 import { logger } from '../utils/logger.js';
+import { SettingsDefaultsManager } from '../shared/SettingsDefaultsManager.js';
+import { USER_SETTINGS_PATH } from '../shared/paths.js';
 import type { ModeConfig } from '../services/domain/types.js';
 
 export const SUMMARY_MODE_MARKER = 'MODE SWITCH: PROGRESS SUMMARY';
@@ -100,11 +102,53 @@ ${mode.prompts.header_memory_start}`;
 // tools put their canonical signal — file path, error message, command
 // header) and the tail (where errors / final-line context typically sit)
 // while dropping the middle. The 10% remainder is the elision marker.
-const OBS_PROMPT_FIELD_MAX_CHARS = 16_000;
+// The cap is configurable through CLAUDE_MEM_OBS_FIELD_MAX_CHARS because the
+// right value depends on the workload: a session dominated by Bash log dumps
+// wants it tight, one built around large diffs wants it loose. The default
+// (4k) is deliberately far below the historical 16k — on a long autonomous
+// loop the payloads, not the observations, are what drive token spend.
+const OBS_PROMPT_FIELD_MAX_CHARS_DEFAULT = 4_000;
 const OBS_PROMPT_FIELD_HEAD_RATIO = 0.6;
 const OBS_PROMPT_FIELD_TAIL_RATIO = 0.3;
+const SETTINGS_CACHE_TTL_MS = 10_000;
 
-function truncateObservationField(value: unknown, maxChars: number = OBS_PROMPT_FIELD_MAX_CHARS): string {
+let cachedFieldMaxChars: number | null = null;
+let cachedFieldMaxCharsAt = 0;
+
+/**
+ * Resolve the per-field payload cap, memoised briefly so that building one
+ * prompt per tool event does not mean one settings file read per tool event.
+ */
+export function resolveObservationFieldMaxChars(now: number = Date.now()): number {
+  if (cachedFieldMaxChars !== null && now - cachedFieldMaxCharsAt < SETTINGS_CACHE_TTL_MS) {
+    return cachedFieldMaxChars;
+  }
+
+  let resolved = OBS_PROMPT_FIELD_MAX_CHARS_DEFAULT;
+  try {
+    const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
+    const parsed = Number(settings.CLAUDE_MEM_OBS_FIELD_MAX_CHARS);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      resolved = Math.floor(parsed);
+    }
+  } catch (error: unknown) {
+    logger.debug('SDK', 'Could not read CLAUDE_MEM_OBS_FIELD_MAX_CHARS, using default', {
+      fallback: OBS_PROMPT_FIELD_MAX_CHARS_DEFAULT
+    }, error instanceof Error ? error : new Error(String(error)));
+  }
+
+  cachedFieldMaxChars = resolved;
+  cachedFieldMaxCharsAt = now;
+  return resolved;
+}
+
+/** Test seam: drop the memoised cap so a changed setting takes effect at once. */
+export function resetObservationFieldMaxCharsCache(): void {
+  cachedFieldMaxChars = null;
+  cachedFieldMaxCharsAt = 0;
+}
+
+function truncateObservationField(value: unknown, maxChars: number = resolveObservationFieldMaxChars()): string {
   // JSON.stringify returns undefined for undefined / functions / symbols;
   // fall back to empty string so the call sites (template literal output)
   // and the length check below stay well-defined.
@@ -118,7 +162,14 @@ function truncateObservationField(value: unknown, maxChars: number = OBS_PROMPT_
   return `${head}\n... <elided chars="${elidedChars}" original_size_chars="${raw.length}" reason="oversize" /> ...\n${tail}`;
 }
 
-export function buildObservationPrompt(obs: Observation): string {
+/**
+ * Render one tool event as an `<observed_from_primary_session>` block.
+ *
+ * Split out of buildObservationPrompt so several events can share a single
+ * request: the surrounding instructions are identical for all of them, and
+ * repeating those instructions once per event is pure overhead.
+ */
+export function buildObservationBlock(obs: Observation): string {
   let toolInput: any;
   let toolOutput: any;
 
@@ -145,11 +196,21 @@ export function buildObservationPrompt(obs: Observation): string {
   <occurred_at>${new Date(obs.created_at_epoch).toISOString()}</occurred_at>${obs.cwd ? `\n  <working_directory>${obs.cwd}</working_directory>` : ''}
   <parameters>${truncateObservationField(toolInput)}</parameters>
   <outcome>${truncateObservationField(toolOutput)}</outcome>
-</observed_from_primary_session>
+</observed_from_primary_session>`;
+}
+
+export function buildObservationPrompt(obs: Observation | Observation[]): string {
+  const events = Array.isArray(obs) ? obs : [obs];
+  const blocks = events.map(buildObservationBlock).join('\n\n');
+  const plural = events.length > 1;
+
+  return `${blocks}
 
 If a <parameters> or <outcome> block above contains an "<elided chars=... />" marker, that field was truncated to fit the observer's context window. Describe only what you can see in the kept portion and do not infer details about the elided range.
-
-Return either one or more <observation>...</observation> blocks, or an empty response if this tool use should be skipped.
+${plural ? `
+The ${events.length} blocks above are consecutive tool uses from the same stretch of work, presented together. Record one <observation> per durable finding — group steps that serve a single purpose into one observation rather than emitting one per block, and skip the blocks that carry nothing worth remembering.
+` : ''}
+Return either one or more <observation>...</observation> blocks, or an empty response if ${plural ? 'none of these tool uses are worth recording' : 'this tool use should be skipped'}.
 Concrete debugging findings from logs, queue state, database rows, session routing, or code-path inspection count as durable discoveries and should be recorded.
 Never reply with prose such as "Skipping", "No substantive tool executions", or any explanation outside XML. Non-XML text is discarded.`;
 }

@@ -97,6 +97,7 @@ describe('OpenAICompatibleProvider summary tier routing', () => {
         yield { type: 'observation', tool_name: 'Read', tool_input: {}, tool_response: {}, prompt_number: 2 };
         yield { type: 'summarize', last_assistant_message: 'done' };
       },
+      claimCoalescedObservations: () => [],
     } as any);
 
     await provider.startSession(makeSession());

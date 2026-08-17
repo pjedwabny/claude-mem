@@ -88,6 +88,9 @@ function makeSessionManager(messages: unknown[]) {
     confirmClaimedMessages: async () => {},
     resetProcessingToPending: async () => {},
     getClaimedMessages: () => [],
+    // Nothing extra is queued in these fixtures, so adaptive batching finds no
+    // additional events and each yielded message stays its own request.
+    claimCoalescedObservations: () => [],
   };
 }
 

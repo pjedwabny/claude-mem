@@ -388,6 +388,38 @@ export class SessionManager {
     }
   }
 
+  /**
+   * Pull additional queued observations into the turn the caller is about to
+   * send, applying the same session bookkeeping getMessageIterator() performs
+   * for the message it yielded.
+   *
+   * The claimed ids join `claimedMessageIds`, so the single
+   * confirmClaimedMessages() that follows a successful response retires the
+   * whole batch — which is what the storage path already expects, since
+   * processAgentResponse() maps parsed observations against every claimed
+   * message rather than against one.
+   */
+  claimCoalescedObservations(
+    sessionDbId: number,
+    accept: (message: PendingMessage, enqueuedAt: number) => boolean
+  ): PendingMessageWithId[] {
+    const session = this.sessions.get(sessionDbId);
+    if (!session) return [];
+
+    const claimed = this.buffer.claimAdditionalObservations(sessionDbId, accept);
+    for (const message of claimed) {
+      session.claimedMessageIds.push(message._persistentId);
+      session.earliestPendingTimestamp = session.earliestPendingTimestamp === null
+        ? message._originalTimestamp
+        : Math.min(session.earliestPendingTimestamp, message._originalTimestamp);
+    }
+
+    if (claimed.length > 0) {
+      session.lastGeneratorActivity = Date.now();
+    }
+    return claimed;
+  }
+
   /** Read-only access to the in-RAM buffer for diagnostics. */
   getMessageBuffer(): SessionMessageBuffer {
     return this.buffer;

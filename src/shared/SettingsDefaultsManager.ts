@@ -26,7 +26,10 @@ export interface SettingsDefaults {
   CLAUDE_MEM_WORKER_HOST: string;
   CLAUDE_MEM_API_TIMEOUT_MS: string;
   CLAUDE_MEM_SKIP_TOOLS: string;
-  CLAUDE_MEM_PROVIDER: string;  
+  CLAUDE_MEM_OBS_FIELD_MAX_CHARS: string;
+  CLAUDE_MEM_OBS_BATCH_MAX_TOKENS: string;
+  CLAUDE_MEM_OBS_HISTORY_MAX_TOKENS: string;
+  CLAUDE_MEM_PROVIDER: string;
   CLAUDE_MEM_CLAUDE_AUTH_METHOD: string;  
   CLAUDE_MEM_GEMINI_API_KEY: string;
   CLAUDE_MEM_GEMINI_MODEL: string;  
@@ -121,6 +124,20 @@ export class SettingsDefaultsManager {
     CLAUDE_MEM_WORKER_HOST: '127.0.0.1',
     CLAUDE_MEM_API_TIMEOUT_MS: String(getTimeout(HOOK_TIMEOUTS.API_REQUEST)),
     CLAUDE_MEM_SKIP_TOOLS: 'ListMcpResourcesTool,SlashCommand,Skill,TodoWrite,AskUserQuestion',
+    // Per-field cap on the tool payload embedded in an observation prompt.
+    // Middle-out truncated (head 60% / tail 30%) with an <elided/> marker, so
+    // the observer sees the command and its outcome without the bulk in
+    // between. Two fields per event, so ~2x this many chars of variable input.
+    CLAUDE_MEM_OBS_FIELD_MAX_CHARS: '4000',
+    // Adaptive batching budget: consecutive queued tool events are coalesced
+    // into one observation request until their combined prompt reaches this
+    // many tokens. Large payloads therefore travel alone while small edits
+    // ride together, which keeps per-request cost flat on long sessions.
+    CLAUDE_MEM_OBS_BATCH_MAX_TOKENS: '12000',
+    // Hard ceiling on the whole outbound request for the OpenAI-compatible
+    // providers. Measured in tokens, not messages — a message-count cap was
+    // the flaw that got the previous truncation removed upstream (#3096).
+    CLAUDE_MEM_OBS_HISTORY_MAX_TOKENS: '25000',
     CLAUDE_MEM_PROVIDER: 'claude',  // Default to Claude
     CLAUDE_MEM_CLAUDE_AUTH_METHOD: 'subscription',  // Default to logged-in Claude SDK auth (not API key)
     CLAUDE_MEM_GEMINI_API_KEY: '',  // Empty by default, can be set via UI or env

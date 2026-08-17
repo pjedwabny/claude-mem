@@ -207,6 +207,47 @@ export class SessionMessageBuffer {
     }
   }
 
+  /**
+   * Claim further already-buffered observation messages, in order, for as long
+   * as `accept` says the growing batch still fits.
+   *
+   * Deliberately non-blocking: it only takes what is already queued and never
+   * waits for more. A busy session (an autonomous loop firing tools back to
+   * back) therefore coalesces its backlog into one request, while an
+   * interactive session — where the buffer is usually empty by the time the
+   * previous response lands — keeps behaving exactly as before, one event per
+   * request and no added latency.
+   *
+   * Stops at the first non-observation message (a `summarize` must stay its own
+   * turn) so batches never straddle a mode change.
+   */
+  claimAdditionalObservations(
+    sessionDbId: number,
+    accept: (message: PendingMessage, enqueuedAt: number) => boolean
+  ): PendingMessageWithId[] {
+    const list = this.buffers.get(sessionDbId);
+    if (!list) return [];
+
+    const claimed: PendingMessageWithId[] = [];
+    for (const candidate of list) {
+      if (candidate.claimed) continue;
+      if (candidate.message.type !== 'observation') break;
+      if (!accept(candidate.message, candidate.enqueuedAt)) break;
+
+      candidate.claimed = true;
+      claimed.push({
+        ...candidate.message,
+        _persistentId: candidate.id,
+        _originalTimestamp: candidate.enqueuedAt
+      });
+    }
+
+    if (claimed.length > 0) {
+      this.onMutate?.();
+    }
+    return claimed;
+  }
+
   private claimNext(sessionDbId: number): BufferedMessage | null {
     const list = this.buffers.get(sessionDbId);
     if (!list) return null;

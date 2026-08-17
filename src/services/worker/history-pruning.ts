@@ -47,6 +47,34 @@ function extractTag(content: string, tag: string): string | null {
   return match ? match[1] : null;
 }
 
+/**
+ * Collapse a past assistant turn to the titles of the observations it recorded.
+ *
+ * Stubbing the user payloads alone bounds the biggest term but not the last
+ * one: the assistant side keeps growing by a full `<observation>` block per
+ * turn, so a long enough session still walks into the context window. The only
+ * thing that history is doing for the observer is telling it what it has
+ * already written down, so that it neither repeats itself nor re-describes the
+ * same work — and a title list carries exactly that. The full blocks are in
+ * SQLite by this point, so nothing is lost.
+ *
+ * Returns null when there is nothing to collapse (no titles found, or the
+ * result would not be smaller), leaving the message untouched.
+ */
+function collapseRecordedObservations(content: string): string | null {
+  const titles = [...content.matchAll(/<title>([\s\S]*?)<\/title>/g)]
+    .map(match => match[1].trim())
+    .filter(title => title.length > 0);
+  if (titles.length === 0) return null;
+
+  const collapsed = `<already_recorded ${PRUNED_ATTRIBUTE}>
+${titles.map(title => `  <title>${title}</title>`).join('\n')}
+  <note>Full observation bodies were persisted. Listed here only so they are not recorded again.</note>
+</already_recorded>`;
+
+  return collapsed.length < content.length ? collapsed : null;
+}
+
 function buildStub(content: string): string {
   const toolName = extractTag(content, 'what_happened') ?? 'unknown';
   const occurredAt = extractTag(content, 'occurred_at') ?? '';
@@ -75,10 +103,20 @@ export function pruneProcessedObservationPayloads(
 
   for (let i = 1; i < end; i++) {
     const message = history[i];
-    if (message.role !== 'user') continue;
     if (message.content.length <= minPrunableChars) continue;
-    if (!message.content.includes(OBSERVATION_OPEN_TAG)) continue;
     if (message.content.includes(SUMMARY_MODE_MARKER)) continue;
+
+    if (message.role === 'assistant') {
+      const collapsed = collapseRecordedObservations(message.content);
+      if (collapsed !== null) {
+        message.content = collapsed;
+        pruned++;
+      }
+      continue;
+    }
+
+    if (message.role !== 'user') continue;
+    if (!message.content.includes(OBSERVATION_OPEN_TAG)) continue;
 
     message.content = buildStub(message.content);
     pruned++;

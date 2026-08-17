@@ -206,6 +206,13 @@ interface GeminiResponse {
     promptTokenCount?: number;
     candidatesTokenCount?: number;
     totalTokenCount?: number;
+    /**
+     * Prefix tokens served from Google's implicit cache. Implicit caching is
+     * on by default for Gemini 2.5+ and the discount is applied automatically,
+     * but it was invisible here because only totalTokenCount was read — so
+     * there was no way to tell a cache hit from a full-price request.
+     */
+    cachedContentTokenCount?: number;
   };
 }
 
@@ -380,6 +387,19 @@ export class GeminiProvider extends OpenAICompatibleProvider<GeminiConfig> {
 
     const content = data.candidates[0].content.parts[0].text;
     const tokensUsed = data.usageMetadata?.totalTokenCount;
+    const promptTokens = data.usageMetadata?.promptTokenCount;
+    const cachedTokens = data.usageMetadata?.cachedContentTokenCount;
+
+    if (promptTokens !== undefined) {
+      logger.debug('SDK', 'Gemini request accounting', {
+        promptTokens,
+        cachedTokens: cachedTokens ?? 0,
+        cacheHitRatio: cachedTokens && promptTokens > 0
+          ? Math.round((cachedTokens / promptTokens) * 100) / 100
+          : 0,
+        outputTokens: data.usageMetadata?.candidatesTokenCount ?? 0
+      });
+    }
 
     return {
       content,

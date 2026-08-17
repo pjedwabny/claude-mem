@@ -3,7 +3,7 @@ import { SessionManager } from './SessionManager.js';
 import { logger } from '../../utils/logger.js';
 import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js';
 import { USER_SETTINGS_PATH } from '../../shared/paths.js';
-import { buildInitPrompt, buildObservationPrompt, buildSummaryPrompt, buildContinuationPrompt } from '../../sdk/prompts.js';
+import { buildInitPrompt, buildObservationBlock, buildObservationPrompt, buildSummaryPrompt, buildContinuationPrompt, type Observation } from '../../sdk/prompts.js';
 import { pruneProcessedObservationPayloads } from './history-pruning.js';
 import type { ActiveSession, ConversationMessage } from '../worker-types.js';
 import { ModeManager } from '../domain/ModeManager.js';
@@ -215,14 +215,50 @@ export abstract class OpenAICompatibleProvider<TConfig extends { apiKey: string;
       throw new Error('Cannot process observations: memorySessionId not yet captured. This session may need to be reinitialized.');
     }
 
-    const obsPrompt = buildObservationPrompt({
-      id: 0,
-      tool_name: message.tool_name!,
-      tool_input: JSON.stringify(message.tool_input),
-      tool_output: JSON.stringify(message.tool_response),
-      created_at_epoch: originalTimestamp ?? Date.now(),
-      cwd: message.cwd
+    const events: Observation[] = [this.toObservationEvent(message, originalTimestamp)];
+
+    // Adaptive batching: absorb whatever else is already queued for this
+    // session until the combined prompt reaches the token budget. On an
+    // autonomous loop this turns a backlog of tool events into one request,
+    // which is what keeps cost proportional to work done rather than to
+    // session length. Nothing is waited for, so interactive sessions are
+    // unaffected.
+    const batchBudgetTokens = this.resolveBatchBudgetTokens();
+    let batchTokens = this.estimateTokens(buildObservationBlock(events[0]));
+    let lastBatchedCwd = message.cwd;
+    let lastBatchedPromptNumber = message.prompt_number;
+
+    const coalesced = this.sessionManager.claimCoalescedObservations(session.sessionDbId, (candidate, enqueuedAt) => {
+      const candidateEvent = this.toObservationEvent(candidate, enqueuedAt);
+      const candidateTokens = this.estimateTokens(buildObservationBlock(candidateEvent));
+      if (events.length > 0 && batchTokens + candidateTokens > batchBudgetTokens) {
+        return false;
+      }
+      batchTokens += candidateTokens;
+      events.push(candidateEvent);
+      if (candidate.cwd) lastBatchedCwd = candidate.cwd;
+      if (candidate.prompt_number !== undefined) lastBatchedPromptNumber = candidate.prompt_number;
+      return true;
     });
+
+    // The batch may reach further than the single yielded message, so the cwd
+    // and prompt number recorded with the resulting observations come from the
+    // last event actually included.
+    const effectiveCwd = lastBatchedCwd ?? lastCwd;
+
+    if (coalesced.length > 0) {
+      if (lastBatchedPromptNumber !== undefined) {
+        session.lastPromptNumber = lastBatchedPromptNumber;
+      }
+      logger.debug('SDK', 'Coalesced queued tool events into one observation request', {
+        sessionId: session.sessionDbId,
+        eventCount: events.length,
+        estimatedPromptTokens: batchTokens,
+        budgetTokens: batchBudgetTokens
+      });
+    }
+
+    const obsPrompt = buildObservationPrompt(events);
     const responseContext = snapshotResponseContext(session);
 
     session.conversationHistory.push({ role: 'user', content: obsPrompt });
@@ -231,6 +267,7 @@ export abstract class OpenAICompatibleProvider<TConfig extends { apiKey: string;
     // request below stays bounded instead of re-sending every prior tool
     // dump (see history-pruning.ts).
     pruneProcessedObservationPayloads(session.conversationHistory);
+    this.enforceHistoryBudget(session);
 
     session.lastPromptSentAt = Date.now();
     session.lastGeneratorSource = 'ingest';
@@ -249,11 +286,76 @@ export abstract class OpenAICompatibleProvider<TConfig extends { apiKey: string;
     if (obsResponse.content || this.forwardEmptyMessageResponse) {
       await processAgentResponse(
         obsResponse.content || '', session, this.dbManager, this.sessionManager,
-        worker, tokensUsed, originalTimestamp, this.providerName, lastCwd, obsResponse.servedModel ?? config.model, responseContext
+        worker, tokensUsed, originalTimestamp, this.providerName, effectiveCwd, obsResponse.servedModel ?? config.model, responseContext
       );
     } else {
       logger.warn('SDK', `Empty ${this.providerName} observation response, leaving queue intact`, {
         sessionId: session.sessionDbId
+      });
+    }
+  }
+
+  /** Shape a queued tool event into the record the prompt builder expects. */
+  private toObservationEvent(
+    message: { tool_name?: string; tool_input?: unknown; tool_response?: unknown; cwd?: string },
+    occurredAt: number | null
+  ): Observation {
+    return {
+      id: 0,
+      tool_name: message.tool_name!,
+      tool_input: JSON.stringify(message.tool_input),
+      tool_output: JSON.stringify(message.tool_response),
+      created_at_epoch: occurredAt ?? Date.now(),
+      cwd: message.cwd
+    };
+  }
+
+  private resolveBatchBudgetTokens(): number {
+    const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
+    const parsed = Number(settings.CLAUDE_MEM_OBS_BATCH_MAX_TOKENS);
+    return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 12_000;
+  }
+
+  private resolveHistoryBudgetTokens(): number {
+    const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
+    const parsed = Number(settings.CLAUDE_MEM_OBS_HISTORY_MAX_TOKENS);
+    return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 25_000;
+  }
+
+  /**
+   * Last line of defence before a request goes out: bound the whole history to
+   * a token budget, dropping the oldest turns after the init prompt.
+   *
+   * Token-based on purpose. The truncation removed by #3096 fired on a
+   * hardcoded 20-message count and cut a conversation at 12k tokens while
+   * claiming to prevent runaway cost — the count was the bug, not the bound.
+   */
+  private enforceHistoryBudget(session: ActiveSession): void {
+    const budget = this.resolveHistoryBudgetTokens();
+    const history = session.conversationHistory;
+    if (history.length <= 2) return;
+
+    let total = history.reduce((sum, m) => sum + this.estimateTokens(m.content), 0);
+    if (total <= budget) return;
+
+    const before = history.length;
+    // Keep index 0 (the init prompt carries the observer's role and output
+    // contract) and always keep the final turn — that is the work being
+    // described right now.
+    let cursor = 1;
+    while (total > budget && cursor < history.length - 1) {
+      total -= this.estimateTokens(history[cursor].content);
+      cursor++;
+    }
+
+    if (cursor > 1) {
+      history.splice(1, cursor - 1);
+      logger.debug('SDK', 'Trimmed observer history to token budget', {
+        sessionId: session.sessionDbId,
+        droppedMessages: before - history.length,
+        historyLength: history.length,
+        estimatedTokens: total,
+        budgetTokens: budget
       });
     }
   }
@@ -285,6 +387,7 @@ export abstract class OpenAICompatibleProvider<TConfig extends { apiKey: string;
     // Same bounding as the observation path: the summary reads the assistant
     // observations for its narrative, not the raw tool payloads behind them.
     pruneProcessedObservationPayloads(session.conversationHistory);
+    this.enforceHistoryBudget(session);
 
     session.lastPromptSentAt = Date.now();
     session.lastGeneratorSource = 'summarize';
